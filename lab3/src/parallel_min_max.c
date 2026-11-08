@@ -1,6 +1,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -15,40 +16,77 @@
 #include "find_min_max.h"
 #include "utils.h"
 
-int main(int argc, char **argv) { //argc — количество аргументов командной строки.
-    int seed = -1;                //argv — массив строк с аргументами командной строки.
+
+/*
+ * Этот флаг изменяется обработчиком сигнала SIGALRM.
+ *
+ * volatile sig_atomic_t используется для переменных,
+ * которые могут изменяться обработчиком сигнала.
+ */
+volatile sig_atomic_t timeout_expired = 0;
+
+
+/* Обработчик сигнала SIGALRM */
+void alarm_handler(int signum)
+{
+    (void)signum;
+
+    timeout_expired = 1;
+}
+
+
+int main(int argc, char **argv)
+{
+    int seed = -1;
     int array_size = -1;
     int pnum = -1;
+
+    /*
+     * timeout = 0 означает:
+     * таймаут не используется.
+     */
+    int timeout = 0;
+
     bool with_files = false;
 
-    // Разбираем аргументы командной строки
+
+    /* Разбираем аргументы командной строки */
     while (true) {
-        static struct option options[] = {  //задаем распознаюзиеся параметры 
-            {"seed", required_argument, 0, 0}, // required_argument - обязательное поле
+
+        static struct option options[] = {
+            {"seed", required_argument, 0, 0},
             {"array_size", required_argument, 0, 0},
             {"pnum", required_argument, 0, 0},
-            {"by_files", no_argument, 0, 'f'}, //no_argument не обязательное
-            {0, 0, 0, 0} //завершающая запись
+            {"timeout", required_argument, 0, 0},
+            {"by_files", no_argument, 0, 'f'},
+            {0, 0, 0, 0}
         };
 
-        int option_index = 0; //индекс параметра из строки 
+        int option_index = 0;
 
-        int c = getopt_long(argc, argv, "f", options, &option_index);
-        //если функция вернет 0 используем option_index
-        //чтобы выяснить какой  длинный параметр распознан
+        int c = getopt_long(
+            argc,
+            argv,
+            "f",
+            options,
+            &option_index
+        );
 
-        if (c == -1) { //когда обработаны все параметры getopt выдаст -1
+        if (c == -1) {
             break;
         }
 
         switch (c) {
-            case 0: //распознан один из длин параметров 
-                switch (option_index) { //определяем какой именно 
+
+            case 0:
+
+                switch (option_index) {
+
                     case 0:
-                        seed = atoi(optarg); //преобразуем из строки число
+                        seed = atoi(optarg);
                         break;
 
-                    case 1: //индексы opt ьерутся из структуры
+                    case 1:
                         array_size = atoi(optarg);
                         break;
 
@@ -56,86 +94,119 @@ int main(int argc, char **argv) { //argc — количество аргумен
                         pnum = atoi(optarg);
                         break;
 
+                    case 3:
+                        timeout = atoi(optarg);
+                        break;
+
                     default:
                         printf("Unknown option\n");
                         return 1;
                 }
+
                 break;
+
 
             case 'f':
                 with_files = true;
                 break;
 
+
             case '?':
                 printf("Unknown argument\n");
                 return 1;
+
 
             default:
                 return 1;
         }
     }
 
-    // Проверяем входные параметры
-    if (optind < argc || //обработка лишних аргументов 
-        seed <= 0 ||     // обработка некорректных аргументов
-        array_size <= 0 || 
+
+    /* Проверяем входные параметры */
+    if (optind < argc ||
+        seed <= 0 ||
+        array_size <= 0 ||
         pnum <= 0 ||
-        pnum > array_size) {
+        pnum > array_size ||
+        timeout < 0) {
 
-        printf("Usage: %s --seed NUM --array_size NUM --pnum NUM [--by_files]\n",
-               argv[0]);
+        printf(
+            "Usage: %s "
+            "--seed NUM "
+            "--array_size NUM "
+            "--pnum NUM "
+            "[--timeout NUM] "
+            "[--by_files]\n",
+            argv[0]
+        );
 
-        printf("NUM must be positive, and pnum must not exceed array_size.\n");
+        printf(
+            "NUM must be positive, "
+            "pnum must not exceed array_size.\n"
+        );
 
         return 1;
     }
 
-    // Создаём массив
-    int *array = malloc(sizeof(int) * array_size); //выделяем память 
 
-    if (array == NULL) { //если памяти нет возвращаем 0 
+    /* Создаём массив */
+    int *array = malloc(sizeof(int) * array_size);
+
+    if (array == NULL) {
         perror("malloc");
         return 1;
     }
 
-    GenerateArray(array, array_size, seed); //создаем массив дл форка
 
-    // Запоминаем PID родительского процесса
+    GenerateArray(array, array_size, seed);
+
+
+    /* Запоминаем PID родительского процесса */
     pid_t parent_pid = getpid();
 
-    // Храним PID всех дочерних процессов
-    pid_t *child_pids = malloc(sizeof(pid_t) * pnum); //getpid() возвращает PID текущего процесса (который выполняет эту строку)
 
-    if (child_pids == NULL) { //проверяем выделилась ли память для хранения id
+    /* Храним PID дочерних процессов */
+    pid_t *child_pids = malloc(sizeof(pid_t) * pnum);
+
+    if (child_pids == NULL) {
         perror("malloc");
         free(array);
         return 1;
     }
 
-    // Для режима pipe создаём отдельный канал каждому ребёнку
-    int (*pipes)[2] = NULL; //pipes - указатель на массивы из 2 эдементо тк
-    //pipes[i][0] - для чтения а с [1] - для записи 
+
+    /*
+     * Для режима pipe создаём отдельный канал
+     * для каждого дочернего процесса.
+     */
+    int (*pipes)[2] = NULL;
 
     if (!with_files) {
-        pipes = malloc(sizeof(int[2]) * pnum); 
+
+        pipes = malloc(sizeof(int[2]) * pnum);
 
         if (pipes == NULL) {
             perror("malloc");
+
             free(child_pids);
             free(array);
+
             return 1;
         }
 
+
         for (int i = 0; i < pnum; i++) {
-            if (pipe(pipes[i]) == -1) { //обработка ошибки создания канала
+
+            if (pipe(pipes[i]) == -1) {
+
                 perror("pipe");
 
-                for (int j = 0; j < i; j++) { 
+                for (int j = 0; j < i; j++) {
                     close(pipes[j][0]);
                     close(pipes[j][1]);
                 }
 
-                free(pipes);  //освобождаем выделенную память тк была оштбка и оно нам не надо
+                free(pipes);
                 free(child_pids);
                 free(array);
 
@@ -144,29 +215,81 @@ int main(int argc, char **argv) { //argc — количество аргумен
         }
     }
 
-    struct timeval start_time; //для засекания времени 
-    gettimeofday(&start_time, NULL); //календарное время записываем в структуру
 
-    // Создаём дочерние процессы
-    int created = 0; //количесто созданных процессов
+    /* Запоминаем время начала работы */
+    struct timeval start_time;
+
+    gettimeofday(&start_time, NULL);
+
+
+    /*
+     * Устанавливаем обработчик SIGALRM.
+     *
+     * Когда истечёт время alarm(),
+     * ядро отправит родительскому процессу SIGALRM.
+     */
+    if (timeout > 0) {
+
+        if (signal(SIGALRM, alarm_handler) == SIG_ERR) {
+            perror("signal");
+
+            if (pipes != NULL) {
+                for (int i = 0; i < pnum; i++) {
+                    close(pipes[i][0]);
+                    close(pipes[i][1]);
+                }
+
+                free(pipes);
+            }
+
+            free(child_pids);
+            free(array);
+
+            return 1;
+        }
+
+        /*
+         * Запускаем таймер.
+         *
+         * Через timeout секунд родитель получит SIGALRM.
+         */
+        alarm(timeout);
+    }
+
+
+    /* Создаём дочерние процессы */
+    int created = 0;
+
 
     for (int i = 0; i < pnum; i++) {
-        pid_t child_pid = fork(); //создаем дочерний процесс
-        // форк в родительском поцессе возвращает id ребенка
-        //в дочернем процессе он возвращает 0
 
+        pid_t child_pid = fork();
 
         if (child_pid == -1) {
             perror("fork");
             break;
         }
 
-        if (child_pid == 0) { 
-            // Код дочернего процесса
 
-            // Закрываем ненужные концы каналов
+        if (child_pid == 0) {
+
+            /* ========================= */
+            /*     ДОЧЕРНИЙ ПРОЦЕСС      */
+            /* ========================= */
+
+
+            /*
+             * Дочернему процессу таймер родителя
+             * не нужен.
+             */
+            alarm(0);
+
+
+            /* Закрываем ненужные концы pipe */
             if (!with_files) {
+
                 for (int j = 0; j < pnum; j++) {
+
                     close(pipes[j][0]);
 
                     if (j != i) {
@@ -175,20 +298,32 @@ int main(int argc, char **argv) { //argc — количество аргумен
                 }
             }
 
-            // Вычисляем границы участка массива
+
+            /* Вычисляем границы участка массива */
             int begin = i * array_size / pnum;
             int end = (i + 1) * array_size / pnum;
 
-            // Находим минимум и максимум своего участка
-            struct MinMax result = GetMinMax(array, begin, end);
+
+            /* Находим минимум и максимум */
+            struct MinMax result =
+                GetMinMax(array, begin, end);
+	    sleep(3);
+
 
             if (with_files) {
-                // Режим передачи результатов через файлы
-                char filename[128]; //резервируем 128 символов для названия файла
 
-                snprintf(filename, sizeof(filename),
-                         "/tmp/parallel_min_max_%ld_%d.txt",
-                         (long)parent_pid, i);
+                /* ===== Передача через файл ===== */
+
+                char filename[128];
+
+                snprintf(
+                    filename,
+                    sizeof(filename),
+                    "/tmp/parallel_min_max_%ld_%d.txt",
+                    (long)parent_pid,
+                    i
+                );
+
 
                 FILE *file = fopen(filename, "w");
 
@@ -197,148 +332,371 @@ int main(int argc, char **argv) { //argc — количество аргумен
                     _exit(1);
                 }
 
-                fprintf(file, "%d %d\n", result.min, result.max);
+
+                fprintf(
+                    file,
+                    "%d %d\n",
+                    result.min,
+                    result.max
+                );
+
 
                 if (fclose(file) != 0) {
                     perror("fclose");
                     _exit(1);
                 }
+
             } else {
-                // Режим передачи результатов через pipe
+
+                /* ===== Передача через pipe ===== */
+
                 ssize_t written = write(
                     pipes[i][1],
                     &result,
                     sizeof(result)
                 );
 
+
                 close(pipes[i][1]);
 
-                if (written != (ssize_t)sizeof(result)) { //совпадает ли количество записанных байтов с размером структуры
+
+                if (written !=
+                    (ssize_t)sizeof(result)) {
+
                     perror("write");
+
                     _exit(1);
                 }
             }
 
-            // Завершаем дочерний процесс
+
+            /* Завершаем дочерний процесс */
             _exit(0);
         }
 
-        // Этот код выполняется только родителем
+
+        /* ========================= */
+        /*    РОДИТЕЛЬСКИЙ ПРОЦЕСС   */
+        /* ========================= */
+
         child_pids[created] = child_pid;
+
         created++;
     }
 
-    // Родитель закрывает каналы для записи тк дочерние процессы уже передали результат выше
+
+    /*
+     * Родитель больше не записывает данные в pipe.
+     */
     if (!with_files) {
-        for (int i = 0; i < pnum; i++) {
+
+        for (int i = 0; i < created; i++) {
             close(pipes[i][1]);
         }
     }
 
-    // Ждём завершения созданных дочерних процессов
+
+    /* Ждём завершения дочерних процессов */
     bool children_ok = true;
 
-    for (int i = 0; i < created; i++) {
-        int status; //статус завершения дочернего процесса
+    int finished = 0;
 
-        if (waitpid(child_pids[i], &status, 0) == -1) { //waitpid докладывает о завершении в status
-            perror("waitpid");
-            children_ok = false;
-            continue;
-        }
 
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-            printf("Child process %d failed\n", i);
-            children_ok = false;
-        }
-    }
+    /*
+     * Неблокирующее ожидание.
+     *
+     * WNOHANG означает:
+     * "не ждать завершения процесса".
+     */
+    while (finished < created && !timeout_expired) {
 
-    if (created != pnum) {
-        children_ok = false;
-    }
+        for (int i = 0; i < created; i++) {
 
-    // Общие минимум и максимум
-    struct MinMax min_max;
-    min_max.min = INT_MAX;
-    min_max.max = INT_MIN;
-
-    // Собираем результаты дочерних процессов
-    for (int i = 0; i < created; i++) {
-        struct MinMax result;
-        bool result_ok = false;
-
-        if (with_files) {
-            // Читаем результат из файла
-            char filename[128];
-
-            snprintf(filename, sizeof(filename),
-                     "/tmp/parallel_min_max_%ld_%d.txt",
-                     (long)parent_pid, i);
-
-            FILE *file = fopen(filename, "r");
-
-            if (file != NULL) {
-                if (fscanf(file, "%d %d",
-                           &result.min, &result.max) == 2) {
-                    result_ok = true;
-                }
-
-                fclose(file);
+            if (child_pids[i] <= 0) {
+                continue;
             }
 
-            // Удаляем временный файл
-            unlink(filename);
-        } else {
-            // Читаем результат из pipe
-            ssize_t received = read(
-                pipes[i][0],
-                &result,
-                sizeof(result)
+
+            int status;
+
+            pid_t result = waitpid(
+                child_pids[i],
+                &status,
+                WNOHANG
             );
 
-            if (received == (ssize_t)sizeof(result)) {
-                result_ok = true;
+
+            if (result == child_pids[i]) {
+
+                finished++;
+
+                child_pids[i] = -1;
+
+
+                if (!WIFEXITED(status) ||
+                    WEXITSTATUS(status) != 0) {
+
+                    children_ok = false;
+                }
             }
 
+            else if (result == -1) {
+
+                perror("waitpid");
+
+                child_pids[i] = -1;
+
+                finished++;
+
+                children_ok = false;
+            }
+        }
+
+
+        /*
+         * Если процессы ещё работают,
+         * немного ждём перед следующей проверкой.
+         */
+        if (finished < created &&
+            !timeout_expired) {
+
+            usleep(1000);
+        }
+    }
+
+
+    /*
+     * Если время истекло —
+     * убиваем незавершившиеся дочерние процессы.
+     */
+    if (timeout_expired) {
+
+        printf(
+            "Timeout expired. "
+            "Terminating child processes...\n"
+        );
+
+
+        children_ok = false;
+
+
+        for (int i = 0; i < created; i++) {
+
+            if (child_pids[i] > 0) {
+
+                if (kill(
+                        child_pids[i],
+                        SIGKILL
+                    ) == -1) {
+
+                    /*
+                     * ESRCH означает:
+                     * процесс уже завершился.
+                     */
+                }
+            }
+        }
+
+
+        /*
+         * После SIGKILL обязательно
+         * забираем завершившихся детей.
+         *
+         * Иначе могут появиться zombie-процессы.
+         */
+        for (int i = 0; i < created; i++) {
+
+            if (child_pids[i] > 0) {
+
+                int status;
+
+                waitpid(
+                    child_pids[i],
+                    &status,
+                    0
+                );
+
+                child_pids[i] = -1;
+            }
+        }
+    }
+
+
+    /*
+     * Отменяем alarm(), если он ещё не сработал.
+     */
+    if (timeout > 0) {
+        alarm(0);
+    }
+
+
+    /*
+     * Если все дочерние процессы
+     * завершились успешно —
+     * читаем результаты.
+     */
+    if (children_ok) {
+
+        struct MinMax total_result;
+
+        total_result.min = INT_MAX;
+        total_result.max = INT_MIN;
+
+
+        for (int i = 0; i < created; i++) {
+
+            struct MinMax result;
+
+
+            if (with_files) {
+
+                char filename[128];
+
+                snprintf(
+                    filename,
+                    sizeof(filename),
+                    "/tmp/parallel_min_max_%ld_%d.txt",
+                    (long)parent_pid,
+                    i
+                );
+
+
+                FILE *file = fopen(
+                    filename,
+                    "r"
+                );
+
+
+                if (file == NULL) {
+                    perror("fopen");
+
+                    children_ok = false;
+
+                    break;
+                }
+
+
+                if (fscanf(
+                        file,
+                        "%d %d",
+                        &result.min,
+                        &result.max
+                    ) != 2) {
+
+                    printf(
+                        "Error reading result "
+                        "from file\n"
+                    );
+
+                    fclose(file);
+
+                    children_ok = false;
+
+                    break;
+                }
+
+
+                fclose(file);
+
+                unlink(filename);
+
+            } else {
+
+                ssize_t bytes_read = read(
+                    pipes[i][0],
+                    &result,
+                    sizeof(result)
+                );
+
+
+                close(pipes[i][0]);
+
+
+                if (bytes_read !=
+                    (ssize_t)sizeof(result)) {
+
+                    perror("read");
+
+                    children_ok = false;
+
+                    break;
+                }
+            }
+
+
+            if (result.min <
+                total_result.min) {
+
+                total_result.min =
+                    result.min;
+            }
+
+
+            if (result.max >
+                total_result.max) {
+
+                total_result.max =
+                    result.max;
+            }
+        }
+
+
+        if (children_ok) {
+
+            struct timeval finish_time;
+
+            gettimeofday(
+                &finish_time,
+                NULL
+            );
+
+
+            long long elapsed_time =
+
+                (finish_time.tv_sec -
+                 start_time.tv_sec) * 1000000LL
+
+                +
+
+                (finish_time.tv_usec -
+                 start_time.tv_usec);
+
+
+            printf(
+                "Min: %d\n",
+                total_result.min
+            );
+
+            printf(
+                "Max: %d\n",
+                total_result.max
+            );
+
+            printf(
+                "Elapsed time: "
+                "%lld microseconds\n",
+                elapsed_time
+            );
+        }
+    }
+
+
+    /*
+     * Закрываем оставшиеся pipe.
+     */
+    if (!with_files && pipes != NULL) {
+
+        for (int i = 0; i < created; i++) {
             close(pipes[i][0]);
         }
 
-        if (!result_ok) {
-            printf("Failed to receive result from child %d\n", i);
-            children_ok = false;
-            continue;
-        }
-
-        if (result.min < min_max.min) {
-            min_max.min = result.min;
-        }
-
-        if (result.max > min_max.max) {
-            min_max.max = result.max;
-        }
+        free(pipes);
     }
 
-    struct timeval finish_time;
-    gettimeofday(&finish_time, NULL);
 
-    double elapsed_time =
-        (finish_time.tv_sec - start_time.tv_sec) * 1000.0;
-
-    elapsed_time +=
-        (finish_time.tv_usec - start_time.tv_usec) / 1000.0;
-
-    free(array);
     free(child_pids);
-    free(pipes);
+    free(array);
 
-    if (!children_ok) {
-        return 1;
-    }
 
-    printf("Min: %d\n", min_max.min);
-    printf("Max: %d\n", min_max.max);
-    printf("Elapsed time: %fms\n", elapsed_time);
-
-    return 0;
+    return children_ok ? 0 : 1;
 }
-
